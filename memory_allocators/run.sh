@@ -15,7 +15,6 @@
 #      console and out/benchmark_<timestamp>.log
 
 set -euo pipefail
-
 # ---------------------------------------------------------------------------
 # 0. Resolve repository root and script-relative paths
 # ---------------------------------------------------------------------------
@@ -65,6 +64,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 # 4. Source the hardware-info helper and print system context
 # ---------------------------------------------------------------------------
 
+set +e
 if [[ -f "${COMMON_DIR}/linux_hw_info.sh" ]]; then
     # shellcheck source=../common/linux_hw_info.sh
     source "${COMMON_DIR}/linux_hw_info.sh"
@@ -72,13 +72,14 @@ if [[ -f "${COMMON_DIR}/linux_hw_info.sh" ]]; then
 else
     echo "[WARNING] ${COMMON_DIR}/linux_hw_info.sh not found – skipping HW info."
 fi
+set -e
 
 # ---------------------------------------------------------------------------
 # 5. Compile
 # ---------------------------------------------------------------------------
 
 echo "[$(date '+%H:%M:%S')] Compiling ${BINARY} with -O3 ..."
-gcc -O3 -pthread "${SCRIPT_DIR}/membench.c" -o "$BINARY"
+gcc -O3 -pthread "${SCRIPT_DIR}/mem_bench.c" -o "$BINARY"
 echo "[$(date '+%H:%M:%S')] Compilation successful."
 
 # ---------------------------------------------------------------------------
