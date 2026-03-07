@@ -46,8 +46,21 @@
 #include <time.h>
 
 /* ---- Fragmentation workload constants ---- */
-#define FRAG_SMALL_SIZE  256
-#define FRAG_LARGE_SIZE  (16 * 1024)
+#define FRAG_SMALL_SIZE   256
+#define FRAG_LARGE_SIZE   (16 * 1024)
+#define FRAG_TOUCH_SIZE   256   /* bytes written per allocation to fault one page */
+
+/*
+ * Fixed pattern copied into every allocation before use/free.
+ * Using a compile-time constant avoids per-iteration heap allocation and
+ * PRNG overhead while still producing a realistic, non-zero memory write.
+ * 256 bytes = FRAG_SMALL_SIZE covers the entire small object and faults one
+ * 4 KiB page of the large object — intentionally leaving the rest non-resident
+ * to model real-world partial-use of large buffers.
+ */
+static const char g_fill_pattern[FRAG_TOUCH_SIZE] = {
+    [0 ... (FRAG_TOUCH_SIZE - 1)] = 0xAB
+};
 
 /* ---- Workload IDs ---- */
 typedef enum {
@@ -173,6 +186,14 @@ static void commit_thread_data(int thread_idx, StatSnapshot* head) {
  * Retain every small (256 B) allocation; immediately free every
  * large (16 KiB) allocation.  The interleaving of long-lived small
  * blocks with freed large blocks fragments the heap.
+ *
+ * Both objects receive a memcpy of FRAG_TOUCH_SIZE (256 B) before
+ * any free().  This faults one 4 KiB page per allocation into
+ * physical memory so that RSS reflects actual residency.  The
+ * remaining pages of the large object are left non-resident,
+ * modelling real-world partial use of large buffers.  A fixed fill
+ * pattern is used (no PRNG, no heap allocation) to keep the write
+ * overhead predictable and minimal relative to malloc/free cost.
  * ================================================================ */
 static void* worker_frag(void* arg) {
     int thread_idx = *(int*)arg;
@@ -188,13 +209,17 @@ static void* worker_frag(void* arg) {
     time_t start_time        = time(NULL);
 
     while (atomic_load(&keep_allocating)) {
-        /* Small — retained */
+        /* Small — retained; write fill pattern to fault the page into RSS */
         void* s = malloc(FRAG_SMALL_SIZE);
-        if (s) tl_allocated += FRAG_SMALL_SIZE;
+        if (s) {
+            memcpy(s, g_fill_pattern, FRAG_TOUCH_SIZE);
+            tl_allocated += FRAG_SMALL_SIZE;
+        }
 
-        /* Large — immediately freed */
+        /* Large — write fill pattern to fault one page, then free to induce fragmentation */
         void* l = malloc(FRAG_LARGE_SIZE);
         if (l) {
+            memcpy(l, g_fill_pattern, FRAG_TOUCH_SIZE);
             tl_allocated += FRAG_LARGE_SIZE;
             free(l);
             tl_freed += FRAG_LARGE_SIZE;
@@ -216,6 +241,11 @@ static void* worker_frag(void* arg) {
  *
  * Object size drawn uniformly from [g_obj_size_min, g_obj_size_max].
  * Retention decision: keep with probability g_obj_retention / 100.
+ *
+ * Every allocation is touched with min(obj_sz, FRAG_TOUCH_SIZE) bytes
+ * from g_fill_pattern before the retention decision.  This ensures the
+ * OS faults the page into physical memory whether the object is kept or
+ * freed immediately, matching the policy used by worker_frag.
  * ================================================================ */
 
 /*
@@ -282,6 +312,17 @@ static void* worker_mixed(void* arg) {
         void* p = malloc(obj_sz);
         if (!p) continue;
         tl_allocated += obj_sz;
+
+        /*
+         * Touch the allocation before the retention decision so that the OS
+         * faults the page(s) into physical memory regardless of whether the
+         * object is kept or freed.  We copy min(obj_sz, FRAG_TOUCH_SIZE) bytes
+         * from the fixed fill pattern: this covers the entire object when it is
+         * smaller than FRAG_TOUCH_SIZE (≤ 256 B) and faults one 4 KiB page for
+         * larger objects — the same bounded-write policy used by worker_frag.
+         */
+        size_t touch = obj_sz < FRAG_TOUCH_SIZE ? obj_sz : FRAG_TOUCH_SIZE;
+        memcpy(p, g_fill_pattern, touch);
 
         /* Retention decision */
         if (rand_pct() < g_obj_retention) {
