@@ -17,10 +17,28 @@
  *
  * RSS Accounting
  * --------------
- *  expected_rss = cumulative_allocated - cumulative_freed   (from thread counters)
+ *  Both workloads write exactly min(obj_size, FRAG_TOUCH_SIZE) bytes into
+ *  every allocation via memcpy before any free().  This is the "touch size".
+ *
+ *  expected_rss = cumulative_touch_allocated - cumulative_touch_freed
+ *
+ *  where:
+ *    cumulative_touch_allocated  = sum of bytes actually written via memcpy
+ *                                  into each allocation (i.e. the touch size,
+ *                                  NOT the full malloc size)
+ *    cumulative_touch_freed      = the same touch-byte count subtracted when
+ *                                  the corresponding object is freed
+ *
+ *  This gives a lower-bound on RSS: the pages that were definitely written and
+ *  therefore must be resident (assuming no swap).
+ *
  *  actual_rss   = resident set size read from /proc/self/statm
- *  rss_bloat    = actual_rss - expected_rss
+ *  rss_bloat    = actual_rss - expected_rss  (must be >= 0)
  *  frag_pct     = rss_bloat / actual_rss * 100.0
+ *
+ *  If actual_rss < expected_rss the program aborts: this is a logic error
+ *  (pages we wrote cannot be non-resident unless swapped out, which we treat
+ *  as an invalid test environment).
  *
  * CLI reference
  * -------------
@@ -72,8 +90,8 @@ typedef enum {
 
 typedef struct StatSnapshot {
     int    interval_index;
-    size_t allocated;   /* cumulative bytes malloc'd by this thread */
-    size_t freed;       /* cumulative bytes free'd   by this thread */
+    size_t allocated;   /* cumulative bytes written via memcpy into malloc'd objects */
+    size_t freed;       /* cumulative touch-bytes subtracted when those objects are freed */
     struct StatSnapshot* next;
 } StatSnapshot;
 
@@ -103,6 +121,11 @@ static ThreadData*      global_stats_head = NULL;
 static pthread_mutex_t  stats_mutex       = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Thread-local accounting (no lock on hot path) ---- */
+/*
+ * tl_allocated: cumulative bytes written via memcpy (touch bytes), not full malloc size.
+ * tl_freed:     touch bytes subtracted when the corresponding object is freed.
+ * Together they form the expected RSS lower-bound for this thread.
+ */
 static __thread size_t tl_allocated = 0;
 static __thread size_t tl_freed     = 0;
 
@@ -213,16 +236,16 @@ static void* worker_frag(void* arg) {
         void* s = malloc(FRAG_SMALL_SIZE);
         if (s) {
             memcpy(s, g_fill_pattern, FRAG_TOUCH_SIZE);
-            tl_allocated += FRAG_SMALL_SIZE;
+            tl_allocated += FRAG_TOUCH_SIZE;   /* count touch bytes, not malloc size */
         }
 
         /* Large — write fill pattern to fault one page, then free to induce fragmentation */
         void* l = malloc(FRAG_LARGE_SIZE);
         if (l) {
             memcpy(l, g_fill_pattern, FRAG_TOUCH_SIZE);
-            tl_allocated += FRAG_LARGE_SIZE;
+            tl_allocated += FRAG_TOUCH_SIZE;   /* only the touched bytes are necessarily resident */
             free(l);
-            tl_freed += FRAG_LARGE_SIZE;
+            tl_freed += FRAG_TOUCH_SIZE;       /* subtract the same touch bytes on free */
         }
 
         time_t now = time(NULL);
@@ -249,44 +272,52 @@ static void* worker_frag(void* arg) {
  * ================================================================ */
 
 /*
- * A simple resizable pool that holds live (retained) pointers so that
- * retained objects remain reachable throughout the benchmark.  We use
- * a per-thread pool to avoid cross-thread locking on the hot path.
+ * A simple resizable pool that holds live (retained) pointers together with
+ * the number of touch bytes that were memcpy'd into each object.  We track
+ * touch bytes so we can subtract exactly the right amount from tl_freed when
+ * the pool is drained.  Per-thread pool avoids cross-thread locking on the
+ * hot path.
  */
 #define POOL_INITIAL_CAP 4096
 
 typedef struct {
     void**  ptrs;
+    size_t* touch_bytes; /* parallel array: bytes memcpy'd into ptrs[i] */
     size_t  len;
     size_t  cap;
 } PtrPool;
 
 static int pool_init(PtrPool* p) {
-    p->ptrs = malloc(POOL_INITIAL_CAP * sizeof(void*));
-    if (!p->ptrs) return -1;
+    p->ptrs        = malloc(POOL_INITIAL_CAP * sizeof(void*));
+    p->touch_bytes = malloc(POOL_INITIAL_CAP * sizeof(size_t));
+    if (!p->ptrs || !p->touch_bytes) {
+        free(p->ptrs);
+        free(p->touch_bytes);
+        return -1;
+    }
     p->len = 0;
     p->cap = POOL_INITIAL_CAP;
     return 0;
 }
 
-static int pool_push(PtrPool* p, void* ptr) {
-    if (p->len == p->cap) {
+static int pool_push(PtrPool* p, void* ptr, size_t touch) {    if (p->len == p->cap) {
         size_t new_cap = p->cap * 2;
-        void** tmp = realloc(p->ptrs, new_cap * sizeof(void*));
-        if (!tmp) return -1;
-        p->ptrs = tmp;
-        p->cap  = new_cap;
+        void** tmp_ptrs = realloc(p->ptrs, new_cap * sizeof(void*));
+        size_t* tmp_touch = realloc(p->touch_bytes, new_cap * sizeof(size_t));
+        if (!tmp_ptrs || !tmp_touch) {
+            /* Realloc partial failure: restore whichever succeeded, signal error */
+            if (tmp_ptrs)  p->ptrs        = tmp_ptrs;
+            if (tmp_touch) p->touch_bytes = tmp_touch;
+            return -1;
+        }
+        p->ptrs        = tmp_ptrs;
+        p->touch_bytes = tmp_touch;
+        p->cap         = new_cap;
     }
-    p->ptrs[p->len++] = ptr;
+    p->ptrs[p->len]        = ptr;
+    p->touch_bytes[p->len] = touch;
+    p->len++;
     return 0;
-}
-
-static void pool_free_all(PtrPool* p) {
-    for (size_t i = 0; i < p->len; i++) free(p->ptrs[i]);
-    free(p->ptrs);
-    p->ptrs = NULL;
-    p->len  = 0;
-    p->cap  = 0;
 }
 
 static void* worker_mixed(void* arg) {
@@ -311,7 +342,6 @@ static void* worker_mixed(void* arg) {
 
         void* p = malloc(obj_sz);
         if (!p) continue;
-        tl_allocated += obj_sz;
 
         /*
          * Touch the allocation before the retention decision so that the OS
@@ -320,22 +350,26 @@ static void* worker_mixed(void* arg) {
          * from the fixed fill pattern: this covers the entire object when it is
          * smaller than FRAG_TOUCH_SIZE (≤ 256 B) and faults one 4 KiB page for
          * larger objects — the same bounded-write policy used by worker_frag.
+         *
+         * Only the touch bytes count toward expected RSS: they are the bytes we
+         * actually wrote and therefore must be resident.
          */
         size_t touch = obj_sz < FRAG_TOUCH_SIZE ? obj_sz : FRAG_TOUCH_SIZE;
         memcpy(p, g_fill_pattern, touch);
+        tl_allocated += touch;   /* count touch bytes, not full malloc size */
 
         /* Retention decision */
         if (rand_pct() < g_obj_retention) {
             /* Retain: push into pool so the object stays live */
-            if (pool_push(&pool, p) != 0) {
+            //if (pool_push(&pool, p, touch) != 0) {
                 /* Pool expansion failed — free to avoid leak */
-                free(p);
-                tl_freed += obj_sz;
-            }
+            //    free(p);
+            //    tl_freed += touch;   /* subtract the same touch bytes on free */
+            //}
         } else {
             /* Discard immediately */
             free(p);
-            tl_freed += obj_sz;
+            tl_freed += touch;   /* subtract the same touch bytes on free */
         }
 
         time_t now = time(NULL);
@@ -345,8 +379,17 @@ static void* worker_mixed(void* arg) {
         }
     }
 
-    /* Free all retained objects before exiting */
-    pool_free_all(&pool);
+    /* Free all retained objects before exiting; account for touch bytes freed */
+    for (size_t i = 0; i < pool.len; i++) {
+        free(pool.ptrs[i]);
+        tl_freed += pool.touch_bytes[i];
+    }
+    free(pool.ptrs);
+    free(pool.touch_bytes);
+    pool.ptrs        = NULL;
+    pool.touch_bytes = NULL;
+    pool.len         = 0;
+    pool.cap         = 0;
 
     commit_thread_data(thread_idx, local_head);
     return NULL;
@@ -389,11 +432,17 @@ static void generate_final_report(GlobalMonitor* history) {
     size_t prev_alloc = 0;
     for (int i = 0; i < num_intervals; i++) {
         /*
-         * expected_rss = cumulative bytes still live (allocated but not freed)
-         * actual_rss   = RSS read from /proc/self/statm at this interval
-         * rss_bloat    = actual_rss - expected_rss
-         *   (positive: allocator holds more memory than the live set needs)
-         * frag_pct     = rss_bloat / actual_rss * 100
+         * expected_rss = cumulative touch-bytes still live
+         *                (touch-bytes allocated − touch-bytes freed)
+         *
+         * This is a lower bound on RSS: every byte we memcpy'd must have
+         * faulted at least one page into physical memory, so actual RSS
+         * must be >= expected RSS.  If it is not, the environment is
+         * inconsistent (e.g. swap activity or a bug in accounting) and
+         * we abort immediately.
+         *
+         * rss_bloat = actual_rss - expected_rss  (allocator overhead / fragmentation)
+         * frag_pct  = rss_bloat / actual_rss * 100
          */
         double expected_mb = (double)(agg_alloc[i] - agg_freed[i]) / (1024.0 * 1024.0);
         double rate        = (double)(agg_alloc[i] - prev_alloc)   / (1024.0 * 1024.0) / g_interval;
@@ -404,6 +453,22 @@ static void generate_final_report(GlobalMonitor* history) {
         printf("%-8d %-14.2f %-12.2f %-12.2f %-14.2f %.2f%%\n",
                (i + 1) * g_interval,
                expected_mb, rate, actual_rss, bloat_mb, frag_pct);
+
+        /* Sanity check: actual RSS must never be less than expected RSS.
+         * Pages that were written via memcpy must be resident (no swap assumed).
+         * A negative bloat indicates either a bug in touch-byte accounting or
+         * that the system is swapping — both are invalid benchmark conditions. */
+        if (bloat_mb < 0.0) {
+            fprintf(stderr,
+                    "\n[FATAL] Interval %d: actual RSS (%.2f MiB) < expected RSS (%.2f MiB).\n"
+                    "        Bloat = %.2f MiB — pages we wrote are not resident.\n"
+                    "        This indicates swap activity or a bug in touch-byte accounting.\n"
+                    "        Aborting benchmark.\n",
+                    (i + 1) * g_interval, actual_rss, expected_mb, bloat_mb);
+            free(agg_alloc);
+            free(agg_freed);
+            exit(1);
+        }
 
         prev_alloc = agg_alloc[i];
     }

@@ -5,13 +5,16 @@
 #   1. Resolves paths relative to the repository root so it can be invoked
 #      from any working directory.
 #   2. Sources common/linux_hw_info.sh and prints full system/HW details.
-#   3. Validates that every non-default allocator's .so file is present before
+#   3. Sources common/sw_versions.sh and prints the installed version of each
+#      allocator library (ptmalloc2/glibc, jemalloc, tcmalloc/gperftools-libs).
+#      Versions that cannot be determined are reported as NA; the run continues.
+#   4. Validates that every non-default allocator's .so file is present before
 #      starting any benchmark run.
-#   4. Runs membench under `perf record` for each allocator, with verbose
+#   5. Runs membench under `perf record` for each allocator, with verbose
 #      progress logging.
-#   5. Saves perf record data and perf script output to   perf/<name>_<t>t/
-#   6. Saves the full benchmark stdout (raw membench output) to             out/
-#   7. Tees all script output (the summary table + log lines) to both the
+#   6. Saves perf record data and perf script output to   perf/<name>_<t>t/
+#   7. Saves the full benchmark stdout (raw membench output) to             out/
+#   8. Tees all script output (the summary table + log lines) to both the
 #      console and out/benchmark_<timestamp>.log
 #
 # Usage: run.sh [options]
@@ -149,7 +152,26 @@ fi
 set -e
 
 # ---------------------------------------------------------------------------
-# 6. Compile
+# 6. Software versions
+# ---------------------------------------------------------------------------
+
+set +e
+if [[ -f "${COMMON_DIR}/sw_versions.sh" ]]; then
+    # shellcheck source=../common/sw_versions.sh
+    source "${COMMON_DIR}/sw_versions.sh"
+    get_allocator_versions
+    echo "[$(date '+%H:%M:%S')] === Allocator Software Versions ==="
+    echo "  ptmalloc2  (glibc)          : ${PTMALLOC2_VERSION}"
+    echo "  jemalloc                    : ${JEMALLOC_VERSION}"
+    echo "  tcmalloc   (gperftools-libs): ${TCMALLOC_VERSION}"
+    echo ""
+else
+    echo "[WARNING] ${COMMON_DIR}/sw_versions.sh not found – skipping version info."
+fi
+set -e
+
+# ---------------------------------------------------------------------------
+# 7. Compile – renumbered; was 6 before sw_versions section was added
 # ---------------------------------------------------------------------------
 
 echo "[$(date '+%H:%M:%S')] Compiling ${BINARY} with -O3 ..."
@@ -157,7 +179,7 @@ gcc -O3 -pthread "${SCRIPT_DIR}/mem_bench.c" -o "$BINARY"
 echo "[$(date '+%H:%M:%S')] Compilation successful."
 
 # ---------------------------------------------------------------------------
-# 7. Pre-flight: verify all required allocator .so files exist
+# 8. Pre-flight: verify all required allocator .so files exist
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -186,7 +208,7 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 8. Benchmark configuration summary
+# 9. Benchmark configuration summary
 # ---------------------------------------------------------------------------
 
 echo "[$(date '+%H:%M:%S')] === Benchmark Configuration ==="
@@ -206,7 +228,7 @@ echo "  membench flags: ${BENCH_FLAGS[*]}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 9. Run benchmarks
+# 10. Run benchmarks
 # ---------------------------------------------------------------------------
 
 echo "[$(date '+%H:%M:%S')] Starting Benchmark Suite ..."
