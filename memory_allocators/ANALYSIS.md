@@ -24,7 +24,7 @@ From an earlier `perf record`, I could find the hot paths in tcmalloc's code whi
 
 Why is ptmalloc2 so slow? What is the bottleneck for performance? I observed a high amount of CPU usage in the kernel space. Specific parameters like `M_TRIM_THRESHOLD` and `M_TOP_PAD` were TBD, as the heap was being grown very frequently for the large allocations.
 
-Whenever the heap was grown, an `mprotect` syscall was also happening which used to take time because of higher contention on the `osq/rwsem`. Upon setting `MALLOC_TOP_PAD_` (noting the underscore at the end of the environment variable name), the performance of ptmalloc2 improved a lot.
+Whenever the heap was grown, an `mprotect` syscall was also happening which used to take time because of higher contention on the `osq/rwsem`. Upon setting `MALLOC_TOP_PAD_` (noting the underscore at the end of the environment variable name), the performance of ptmalloc2 improved a lot. MALLOC_TOP_PAD_ setting is used to decide how much padding to add to the active heap when it needs to be grown to satisfy allocation requests. It provides a tradeoff between under-utilized memory at the top-chunk and reduced allocation performance due to the number of syscalls. In my perf tests, I increased this value to 1g.
 
 The heap was being grown frequently due to the small allocations. Debugging this was a pain on RHEL primarily because RHEL doesn't provide debug binaries for glibc in a straightforward way. You need to first enroll your RHEL machine to an existing subscription in order to setup the required repositories for running `debuginfo-install`. Eventually, I gave up on it because of running RHEL in a sort of air-gapped environment.
 
