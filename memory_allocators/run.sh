@@ -193,7 +193,7 @@ export MALLOC_ARENA_MAX=${NUM_VCORES}
 #   When true, jemalloc retains virtual memory for faster future reuse
 #   instead of munmap(2)'ing it.  Set false to measure RSS more accurately.
 #
-export MALLOC_CONF="narenas:${NUM_VCORES},background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000,tcache:true,tcache_max:32768,lg_extent_max_active_fit:6,percpu_arena:percpu,thp:default,metadata_thp:disabled,retain:true"
+export MALLOC_CONF="narenas:${NUM_VCORES},background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000,tcache:true,lg_extent_max_active_fit:6,percpu_arena:percpu,thp:default,metadata_thp:disabled,retain:true"
 
 # ---------------------------------------------------------------------------
 # 0. Resolve repository root and script-relative paths
