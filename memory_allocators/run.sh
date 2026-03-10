@@ -30,6 +30,14 @@
 
 set -euo pipefail
 
+# Setting top chunk padding for ptmalloc2 to reduce number of sbrk calls.
+# Set it to 512m.
+# This increases memory wastage but improves the performance of ptmalloc2 by atleast 30%-40%
+export MALLOC_TOP_PAD_=536870912
+
+# Set TCMALLOC_SKIP_SBRK to 1 to force tcmalloc to only use mmap
+# export TCMALLOC_SKIP_SBRK=1
+
 # ---------------------------------------------------------------------------
 # 0. Resolve repository root and script-relative paths
 # ---------------------------------------------------------------------------
