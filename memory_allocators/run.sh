@@ -401,6 +401,11 @@ echo "==========================================================================
 printf "%-14s %-12s %-16s %-10s\n" "Allocator" "Threads" "Rate (MiB/s)" "Frag %"
 echo "================================================================================"
 
+# Arrays to accumulate results for the post-run comparison summary.
+RESULT_NAMES=()
+RESULT_RATES=()
+RESULT_FRAGS=()
+
 for alloc_entry in "${ALLOCATORS[@]}"; do
     IFS=":" read -r name so_path <<< "$alloc_entry"
 
@@ -453,15 +458,32 @@ for alloc_entry in "${ALLOCATORS[@]}"; do
     chmod 755 "${PERF_SCRIPT_OUT}"
     echo "  [$(date '+%H:%M:%S')] perf script saved → ${PERF_SCRIPT_OUT}"
 
-    # Parse summary line from membench output
-    # Last data row columns: Time  Expected  Rate  RSS  Bloat  Frag%
+    # Parse summary line from membench output.
+    # The AGGREGATED BENCHMARK REPORT columns (11 total):
+    #   $1  Time(s)
+    #   $2  VSS Alloc(MiB)
+    #   $3  VSS Freed(MiB)
+    #   $4  RSS Alloc(MiB)
+    #   $5  RSS Freed(MiB)
+    #   $6  RSS Expected(MiB)
+    #   $7  Rate(MiB/s)        ← allocation throughput
+    #   $8  RSS Actual(MiB)
+    #   $9  RSS Bloat(MiB)
+    #   $10 Frag %             ← printed as "N.NN%" (no space before %)
+    #   $11 Iterations
     LAST_LINE=$(grep -E '^[0-9]' "$RAW_OUT" | tail -n 1)
-    RATE=$(awk '{print $3}' <<< "$LAST_LINE")
-    FRAG=$(awk '{print $6}' <<< "$LAST_LINE")
+    RATE=$(awk '{print $7}' <<< "$LAST_LINE")
+    # Strip a trailing '%' if present (e.g. "8.18%" → "8.18")
+    FRAG=$(awk '{gsub(/%/,""); print $10}' <<< "$LAST_LINE")
 
     printf "%-14s %-12s %-16s %-10s\n" "$name" "$THREADS" "$RATE" "$FRAG"
 
     echo "  [$(date '+%H:%M:%S')] ---- Run complete: ${name}/${THREADS}t  rate=${RATE} MiB/s  frag=${FRAG}% ----"
+
+    # Accumulate for the final comparison summary.
+    RESULT_NAMES+=("$name")
+    RESULT_RATES+=("$RATE")
+    RESULT_FRAGS+=("$FRAG")
 done
 
 echo ""
@@ -470,3 +492,210 @@ echo "[$(date '+%H:%M:%S')] Benchmark suite complete."
 echo "  Raw outputs  : ${OUT_DIR}/"
 echo "  Perf data    : ${PERF_DIR}/"
 echo "  Full log     : ${LOG_FILE}"
+
+# ---------------------------------------------------------------------------
+# 11. Post-run comparison summary
+# ---------------------------------------------------------------------------
+
+if [[ ${#RESULT_NAMES[@]} -eq 0 ]]; then
+    echo ""
+    echo "[WARNING] No allocator runs completed – skipping comparison summary."
+else
+    echo ""
+    echo "================================================================================"
+    echo "[$(date '+%H:%M:%S')] === Allocator Comparison Summary ==="
+    echo "================================================================================"
+    printf "%-14s %-20s %-14s\n" "Allocator" "Alloc Rate (MiB/s)" "Frag %"
+    echo "--------------------------------------------------------------------------------"
+    for i in "${!RESULT_NAMES[@]}"; do
+        printf "%-14s %-20s %-14s\n" \
+            "${RESULT_NAMES[$i]}" "${RESULT_RATES[$i]}" "${RESULT_FRAGS[$i]}"
+    done
+    echo "--------------------------------------------------------------------------------"
+
+    # Find the winner for each metric using awk for floating-point comparison.
+    BEST_RATE_NAME=$(
+        awk -v n="${#RESULT_NAMES[@]}" \
+            -v names="$(IFS='|'; echo "${RESULT_NAMES[*]}")" \
+            -v rates="$(IFS='|'; echo "${RESULT_RATES[*]}")" \
+        'BEGIN {
+            split(names, nArr, "|")
+            split(rates, rArr, "|")
+            best = -1; bestName = "N/A"
+            for (i = 1; i <= n; i++) {
+                v = rArr[i] + 0
+                if (v > best) { best = v; bestName = nArr[i] }
+            }
+            print bestName
+        }'
+    )
+
+    BEST_FRAG_NAME=$(
+        awk -v n="${#RESULT_NAMES[@]}" \
+            -v names="$(IFS='|'; echo "${RESULT_NAMES[*]}")" \
+            -v frags="$(IFS='|'; echo "${RESULT_FRAGS[*]}")" \
+        'BEGIN {
+            split(names, nArr, "|")
+            split(frags, fArr, "|")
+            best = 1e18; bestName = "N/A"
+            for (i = 1; i <= n; i++) {
+                v = fArr[i] + 0
+                if (v < best) { best = v; bestName = nArr[i] }
+            }
+            print bestName
+        }'
+    )
+
+    echo ""
+    echo "  Best allocation rate : ${BEST_RATE_NAME}"
+    echo "  Best (lowest) frag % : ${BEST_FRAG_NAME}"
+    echo "================================================================================"
+
+    # -----------------------------------------------------------------------
+    # Head-to-head confusion matrices — one per metric.
+    #
+    # Layout: rows = challenger, columns = baseline.
+    # Read a cell as: "how does the ROW allocator compare to the COL allocator?"
+    #
+    # Cell formula:
+    #   rate matrix:  (row_rate - col_rate) / |col_rate| * 100
+    #   frag matrix:  (row_frag - col_frag) / |col_frag| * 100
+    #                 falls back to absolute diff when col_frag == 0
+    #
+    # Sign convention:
+    #   rate  +N% → row is N% faster   (better)
+    #   rate  -N% → row is N% slower   (worse)
+    #   frag  +N% → row has N% more fragmentation  (worse)
+    #   frag  -N% → row has N% less fragmentation  (better)
+    #
+    # Cell width is derived at runtime from the widest value that will actually
+    # appear, so columns stay aligned regardless of the magnitude of the numbers.
+    # Diagonal cells show "--" (self-comparison is undefined).
+    # -----------------------------------------------------------------------
+
+    # ---- Matrix 1: Allocation Rate ----
+    echo ""
+    echo "[$(date '+%H:%M:%S')] === H2H Matrix 1/2: Allocation Rate  (row_rate / col_rate - 1) ==="
+    echo "  +N% → row is faster  |  -N% → row is slower"
+    echo ""
+
+    awk -v n="${#RESULT_NAMES[@]}" \
+        -v names="$(IFS='|'; echo "${RESULT_NAMES[*]}")" \
+        -v vals="$(IFS='|'; echo "${RESULT_RATES[*]}")" \
+    'BEGIN {
+        split(names, N, "|")
+        split(vals,  V, "|")
+
+        # Pre-compute every cell string so we know the true max width.
+        for (i = 1; i <= n; i++)
+            for (j = 1; j <= n; j++) {
+                if (i == j) {
+                    cell[i,j] = "--"
+                } else {
+                    vi = V[i] + 0; vj = V[j] + 0
+                    d  = (vj != 0) ? (vi - vj) / (vj < 0 ? -vj : vj) * 100 : 0
+                    sg = (d >= 0) ? "+" : ""
+                    cell[i,j] = sprintf("%s%.2f%%", sg, d)
+                }
+            }
+
+        # Row-label width: longest name + 2, min 12
+        lw = 12
+        for (i = 1; i <= n; i++) { l = length(N[i]) + 2; if (l > lw) lw = l }
+
+        # Cell width: widest cell string + 2 padding each side, and wide enough
+        # for the column header; minimum 10
+        cw = 10
+        for (i = 1; i <= n; i++) {
+            l = length(N[i]) + 4; if (l > cw) cw = l   # header fits
+            for (j = 1; j <= n; j++) {
+                l = length(cell[i,j]) + 4; if (l > cw) cw = l
+            }
+        }
+
+        # Header
+        printf "%-*s", lw, "ROW \\ COL"
+        for (j = 1; j <= n; j++) {
+            lpad = int((cw - length(N[j])) / 2)
+            rpad = cw - length(N[j]) - lpad
+            printf "%*s%s%*s", lpad, "", N[j], rpad, ""
+        }
+        printf "\n"
+
+        sep = ""; for (k = 0; k < lw + cw * n; k++) sep = sep "-"; print sep
+
+        for (i = 1; i <= n; i++) {
+            printf "%-*s", lw, N[i]
+            for (j = 1; j <= n; j++) {
+                lpad = int((cw - length(cell[i,j])) / 2)
+                rpad = cw - length(cell[i,j]) - lpad
+                printf "%*s%s%*s", lpad, "", cell[i,j], rpad, ""
+            }
+            printf "\n"
+        }
+        print sep
+    }'
+
+    # ---- Matrix 2: Fragmentation % ----
+    echo ""
+    echo "[$(date '+%H:%M:%S')] === H2H Matrix 2/2: Fragmentation %%  (row_frag / col_frag - 1) ==="
+    echo "  +N% → row has more fragmentation (worse)  |  -N% → row has less fragmentation (better)"
+    echo ""
+
+    awk -v n="${#RESULT_NAMES[@]}" \
+        -v names="$(IFS='|'; echo "${RESULT_NAMES[*]}")" \
+        -v vals="$(IFS='|'; echo "${RESULT_FRAGS[*]}")" \
+    'BEGIN {
+        split(names, N, "|")
+        split(vals,  V, "|")
+
+        for (i = 1; i <= n; i++)
+            for (j = 1; j <= n; j++) {
+                if (i == j) {
+                    cell[i,j] = "--"
+                } else {
+                    vi = V[i] + 0; vj = V[j] + 0
+                    if (vj != 0)
+                        d = (vi - vj) / (vj < 0 ? -vj : vj) * 100
+                    else
+                        d = vi - vj   # absolute diff when baseline is zero
+                    sg = (d >= 0) ? "+" : ""
+                    cell[i,j] = sprintf("%s%.2f%%", sg, d)
+                }
+            }
+
+        lw = 12
+        for (i = 1; i <= n; i++) { l = length(N[i]) + 2; if (l > lw) lw = l }
+
+        cw = 10
+        for (i = 1; i <= n; i++) {
+            l = length(N[i]) + 4; if (l > cw) cw = l
+            for (j = 1; j <= n; j++) {
+                l = length(cell[i,j]) + 4; if (l > cw) cw = l
+            }
+        }
+
+        printf "%-*s", lw, "ROW \\ COL"
+        for (j = 1; j <= n; j++) {
+            lpad = int((cw - length(N[j])) / 2)
+            rpad = cw - length(N[j]) - lpad
+            printf "%*s%s%*s", lpad, "", N[j], rpad, ""
+        }
+        printf "\n"
+
+        sep = ""; for (k = 0; k < lw + cw * n; k++) sep = sep "-"; print sep
+
+        for (i = 1; i <= n; i++) {
+            printf "%-*s", lw, N[i]
+            for (j = 1; j <= n; j++) {
+                lpad = int((cw - length(cell[i,j])) / 2)
+                rpad = cw - length(cell[i,j]) - lpad
+                printf "%*s%s%*s", lpad, "", cell[i,j], rpad, ""
+            }
+            printf "\n"
+        }
+        print sep
+    }'
+
+    echo "================================================================================"
+fi
