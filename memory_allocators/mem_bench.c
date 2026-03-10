@@ -18,27 +18,47 @@
  * RSS Accounting
  * --------------
  *  Both workloads write exactly min(obj_size, FRAG_TOUCH_SIZE) bytes into
- *  every allocation via memcpy before any free().  This is the "touch size".
+ *  every allocation via memcpy before any free().  This memcpy — regardless
+ *  of how many bytes it copies — causes the OS to fault in exactly one
+ *  physical page per allocation.  The system page size is queried once at
+ *  program start with sysconf(_SC_PAGESIZE) and stored in g_page_size.
  *
- *  expected_rss = cumulative_touch_allocated - cumulative_touch_freed
+ *  rss_expected = (cumulative_alloc_pages - cumulative_freed_pages) * g_page_size
  *
  *  where:
- *    cumulative_touch_allocated  = sum of bytes actually written via memcpy
- *                                  into each allocation (i.e. the touch size,
- *                                  NOT the full malloc size)
- *    cumulative_touch_freed      = the same touch-byte count subtracted when
- *                                  the corresponding object is freed
+ *    cumulative_alloc_pages  = number of malloc'd objects that were touched
+ *                              (each contributes one page to RSS)
+ *    cumulative_freed_pages  = number of those objects that were subsequently
+ *                              freed (each frees one estimated page from RSS)
  *
- *  This gives a lower-bound on RSS: the pages that were definitely written and
- *  therefore must be resident (assuming no swap).
+ *  This gives a lower-bound on RSS: every touched page must be resident
+ *  (assuming no swap).
  *
- *  actual_rss   = resident set size read from /proc/self/statm
- *  rss_bloat    = actual_rss - expected_rss  (must be >= 0)
- *  frag_pct     = rss_bloat / actual_rss * 100.0
+ *  rss_actual   = resident set size read from /proc/self/statm
+ *  rss_bloat    = rss_actual - rss_expected  (must be >= 0)
+ *  frag_pct     = rss_bloat / rss_actual * 100.0
  *
- *  If actual_rss < expected_rss the program aborts: this is a logic error
+ *  If rss_actual < rss_expected the program aborts: this is a logic error
  *  (pages we wrote cannot be non-resident unless swapped out, which we treat
  *  as an invalid test environment).
+ *
+ * VSS Accounting
+ * --------------
+ *  VSS (virtual address space) columns reflect the sizes passed as arguments
+ *  to malloc() and free() calls, i.e. the application-visible commitment
+ *  before any allocator rounding or page granularity is applied.
+ *
+ *  vss_allocated = cumulative bytes requested via malloc() across all threads
+ *  vss_freed     = cumulative bytes freed (original malloc size for each ptr)
+ *
+ *  These values are tracked in the per-thread tl_vss_allocated / tl_vss_freed
+ *  accumulators and snapshotted into StatSnapshot::vss_allocated / vss_freed
+ *  at each reporting interval.
+ *
+ *  Theoretical minimum RSS (frag workload):
+ *    Each iteration retains one small object and frees one large object, so
+ *    the net page count grows by exactly one page per iteration:
+ *      theo_min_rss = total_iterations * g_page_size
  *
  * CLI reference
  * -------------
@@ -90,13 +110,17 @@ typedef enum {
 
 typedef struct StatSnapshot {
     int    interval_index;
-    size_t allocated;   /* cumulative bytes written via memcpy into malloc'd objects */
-    size_t freed;       /* cumulative touch-bytes subtracted when those objects are freed */
+    size_t rss_allocated;   /* cumulative page-size bytes counted for malloc'd+touched objects */
+    size_t rss_freed;       /* cumulative page-size bytes subtracted when those objects are freed */
+    size_t vss_allocated;   /* cumulative bytes passed as size argument to malloc() */
+    size_t vss_freed;       /* cumulative bytes passed as size argument to free()'d objects */
+    size_t iterations;      /* total loop iterations in this interval (across this thread) */
     struct StatSnapshot* next;
 } StatSnapshot;
 
 typedef struct ThreadData {
     int          thread_idx;
+    size_t       iterations;      /* total loop iterations executed by this thread */
     StatSnapshot* snapshots_head;
     struct ThreadData* next;
 } ThreadData;
@@ -115,6 +139,15 @@ static size_t       g_obj_size_min   = 64;
 static size_t       g_obj_size_max   = 65536;
 static int          g_obj_retention  = 50;   /* 0-100 % */
 
+/*
+ * System page size, queried once at program start via sysconf(_SC_PAGESIZE).
+ * Each memcpy of FRAG_TOUCH_SIZE bytes (256 B) into a freshly malloc'd object
+ * causes the OS to fault in exactly one physical page.  We therefore use
+ * g_page_size — not the number of bytes actually written — as the RSS
+ * contribution per allocation, and as the estimated RSS freed per free() call.
+ */
+static size_t g_page_size = 4096;   /* overwritten in main() */
+
 /* ---- Global state ---- */
 static atomic_bool      keep_allocating   = true;
 static ThreadData*      global_stats_head = NULL;
@@ -122,12 +155,22 @@ static pthread_mutex_t  stats_mutex       = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Thread-local accounting (no lock on hot path) ---- */
 /*
- * tl_allocated: cumulative bytes written via memcpy (touch bytes), not full malloc size.
- * tl_freed:     touch bytes subtracted when the corresponding object is freed.
+ * tl_rss_allocated: cumulative pages faulted in by malloc+memcpy, expressed
+ *                   in bytes (each allocation contributes g_page_size bytes).
+ * tl_rss_freed:     estimated pages returned on free(), expressed in bytes
+ *                   (each free() contributes g_page_size bytes).
  * Together they form the expected RSS lower-bound for this thread.
+ *
+ * tl_vss_allocated: cumulative bytes passed as the size argument to malloc().
+ * tl_vss_freed:     cumulative bytes passed as the size argument to free()'d
+ *                   objects (i.e. the original malloc size for each freed ptr).
+ * These reflect the application-visible virtual address space commitment.
  */
-static __thread size_t tl_allocated = 0;
-static __thread size_t tl_freed     = 0;
+static __thread size_t tl_rss_allocated = 0;
+static __thread size_t tl_rss_freed     = 0;
+static __thread size_t tl_vss_allocated = 0;
+static __thread size_t tl_vss_freed     = 0;
+static __thread size_t tl_iterations    = 0;
 
 /* ---- PRNG (xorshift64, per-thread seeded from thread index) ---- */
 static __thread uint64_t tl_rng_state = 0;
@@ -182,8 +225,11 @@ static void record_snapshot(StatSnapshot** head, StatSnapshot** tail,
     StatSnapshot* snp = malloc(sizeof(StatSnapshot));
     if (!snp) return;
     snp->interval_index = interval_idx;
-    snp->allocated      = tl_allocated;
-    snp->freed          = tl_freed;
+    snp->rss_allocated  = tl_rss_allocated;
+    snp->rss_freed      = tl_rss_freed;
+    snp->vss_allocated  = tl_vss_allocated;
+    snp->vss_freed      = tl_vss_freed;
+    snp->iterations     = tl_iterations;
     snp->next           = NULL;
 
     if (!*head) *head = snp;
@@ -191,10 +237,11 @@ static void record_snapshot(StatSnapshot** head, StatSnapshot** tail,
     *tail = snp;
 }
 
-static void commit_thread_data(int thread_idx, StatSnapshot* head) {
+static void commit_thread_data(int thread_idx, size_t iterations, StatSnapshot* head) {
     ThreadData* td = malloc(sizeof(ThreadData));
     if (!td) return;
     td->thread_idx      = thread_idx;
+    td->iterations      = iterations;
     td->snapshots_head  = head;
 
     pthread_mutex_lock(&stats_mutex);
@@ -232,20 +279,23 @@ static void* worker_frag(void* arg) {
     time_t start_time        = time(NULL);
 
     while (atomic_load(&keep_allocating)) {
-        /* Small — retained; write fill pattern to fault the page into RSS */
+        tl_iterations++;
+
+        /* Small — retained; write fill pattern to fault exactly one page into RSS */
         void* s = malloc(FRAG_SMALL_SIZE);
         if (s) {
             memcpy(s, g_fill_pattern, FRAG_TOUCH_SIZE);
-            tl_allocated += FRAG_TOUCH_SIZE;   /* count touch bytes, not malloc size */
+            tl_rss_allocated += FRAG_TOUCH_SIZE;   /* one page faulted per allocation */
+            tl_vss_allocated += FRAG_SMALL_SIZE;   /* bytes requested from allocator  */
         }
 
         /* Large — write fill pattern to fault one page, then free to induce fragmentation */
         void* l = malloc(FRAG_LARGE_SIZE);
         if (l) {
             memcpy(l, g_fill_pattern, FRAG_TOUCH_SIZE);
-            tl_allocated += FRAG_TOUCH_SIZE;   /* only the touched bytes are necessarily resident */
+            tl_vss_allocated += FRAG_LARGE_SIZE;   /* bytes requested from allocator  */
             free(l);
-            tl_freed += FRAG_TOUCH_SIZE;       /* subtract the same touch bytes on free */
+            tl_vss_freed += FRAG_LARGE_SIZE;       /* bytes freed (large object)       */
         }
 
         time_t now = time(NULL);
@@ -255,7 +305,7 @@ static void* worker_frag(void* arg) {
         }
     }
 
-    commit_thread_data(thread_idx, local_head);
+    commit_thread_data(thread_idx, tl_iterations, local_head);
     return NULL;
 }
 
@@ -271,55 +321,6 @@ static void* worker_frag(void* arg) {
  * freed immediately, matching the policy used by worker_frag.
  * ================================================================ */
 
-/*
- * A simple resizable pool that holds live (retained) pointers together with
- * the number of touch bytes that were memcpy'd into each object.  We track
- * touch bytes so we can subtract exactly the right amount from tl_freed when
- * the pool is drained.  Per-thread pool avoids cross-thread locking on the
- * hot path.
- */
-#define POOL_INITIAL_CAP 4096
-
-typedef struct {
-    void**  ptrs;
-    size_t* touch_bytes; /* parallel array: bytes memcpy'd into ptrs[i] */
-    size_t  len;
-    size_t  cap;
-} PtrPool;
-
-static int pool_init(PtrPool* p) {
-    p->ptrs        = malloc(POOL_INITIAL_CAP * sizeof(void*));
-    p->touch_bytes = malloc(POOL_INITIAL_CAP * sizeof(size_t));
-    if (!p->ptrs || !p->touch_bytes) {
-        free(p->ptrs);
-        free(p->touch_bytes);
-        return -1;
-    }
-    p->len = 0;
-    p->cap = POOL_INITIAL_CAP;
-    return 0;
-}
-
-static int pool_push(PtrPool* p, void* ptr, size_t touch) {    if (p->len == p->cap) {
-        size_t new_cap = p->cap * 2;
-        void** tmp_ptrs = realloc(p->ptrs, new_cap * sizeof(void*));
-        size_t* tmp_touch = realloc(p->touch_bytes, new_cap * sizeof(size_t));
-        if (!tmp_ptrs || !tmp_touch) {
-            /* Realloc partial failure: restore whichever succeeded, signal error */
-            if (tmp_ptrs)  p->ptrs        = tmp_ptrs;
-            if (tmp_touch) p->touch_bytes = tmp_touch;
-            return -1;
-        }
-        p->ptrs        = tmp_ptrs;
-        p->touch_bytes = tmp_touch;
-        p->cap         = new_cap;
-    }
-    p->ptrs[p->len]        = ptr;
-    p->touch_bytes[p->len] = touch;
-    p->len++;
-    return 0;
-}
-
 static void* worker_mixed(void* arg) {
     int thread_idx = *(int*)arg;
     free(arg);
@@ -328,15 +329,14 @@ static void* worker_mixed(void* arg) {
     tl_rng_state = (uint64_t)(uintptr_t)&thread_idx ^ (uint64_t)time(NULL)
                    ^ (uint64_t)thread_idx * 6364136223846793005ULL;
 
-    PtrPool pool;
-    if (pool_init(&pool) != 0) return NULL;
-
     StatSnapshot* local_head = NULL;
     StatSnapshot* local_tail = NULL;
     int   current_interval   = 0;
     time_t start_time        = time(NULL);
 
     while (atomic_load(&keep_allocating)) {
+        tl_iterations++;
+
         /* Uniform random object size in [min, max] */
         size_t obj_sz = rand_range_size(g_obj_size_min, g_obj_size_max);
 
@@ -351,25 +351,22 @@ static void* worker_mixed(void* arg) {
          * smaller than FRAG_TOUCH_SIZE (≤ 256 B) and faults one 4 KiB page for
          * larger objects — the same bounded-write policy used by worker_frag.
          *
-         * Only the touch bytes count toward expected RSS: they are the bytes we
-         * actually wrote and therefore must be resident.
+         * Regardless of how many bytes were written, the memcpy causes the OS
+         * to fault in exactly one physical page per allocation.  We therefore
+         * use g_page_size — not the number of bytes written — as the RSS
+         * contribution for both alloc and free accounting.
          */
         size_t touch = obj_sz < FRAG_TOUCH_SIZE ? obj_sz : FRAG_TOUCH_SIZE;
         memcpy(p, g_fill_pattern, touch);
-        tl_allocated += touch;   /* count touch bytes, not full malloc size */
+        tl_rss_allocated += touch;
+        tl_vss_allocated += obj_sz;   /* bytes requested from allocator */
 
         /* Retention decision */
-        if (rand_pct() < g_obj_retention) {
-            /* Retain: push into pool so the object stays live */
-            //if (pool_push(&pool, p, touch) != 0) {
-                /* Pool expansion failed — free to avoid leak */
-            //    free(p);
-            //    tl_freed += touch;   /* subtract the same touch bytes on free */
-            //}
-        } else {
+        if (rand_pct() >= g_obj_retention) {
             /* Discard immediately */
             free(p);
-            tl_freed += touch;   /* subtract the same touch bytes on free */
+            tl_rss_freed += touch;   /* one page freed per free() call */
+            tl_vss_freed += obj_sz;  /* bytes freed (original malloc size) */
         }
 
         time_t now = time(NULL);
@@ -379,19 +376,7 @@ static void* worker_mixed(void* arg) {
         }
     }
 
-    /* Free all retained objects before exiting; account for touch bytes freed */
-    for (size_t i = 0; i < pool.len; i++) {
-        free(pool.ptrs[i]);
-        tl_freed += pool.touch_bytes[i];
-    }
-    free(pool.ptrs);
-    free(pool.touch_bytes);
-    pool.ptrs        = NULL;
-    pool.touch_bytes = NULL;
-    pool.len         = 0;
-    pool.cap         = 0;
-
-    commit_thread_data(thread_idx, local_head);
+    commit_thread_data(thread_idx, tl_iterations, local_head);
     return NULL;
 }
 
@@ -400,81 +385,124 @@ static void* worker_mixed(void* arg) {
  * ================================================================ */
 
 static void generate_final_report(GlobalMonitor* history) {
-    int     num_intervals = g_duration / g_interval;
-    size_t* agg_alloc     = calloc(num_intervals, sizeof(size_t));
-    size_t* agg_freed     = calloc(num_intervals, sizeof(size_t));
+    int     num_intervals  = g_duration / g_interval;
+    size_t* agg_rss_alloc  = calloc(num_intervals, sizeof(size_t));
+    size_t* agg_rss_freed  = calloc(num_intervals, sizeof(size_t));
+    size_t* agg_vss_alloc  = calloc(num_intervals, sizeof(size_t));
+    size_t* agg_vss_freed  = calloc(num_intervals, sizeof(size_t));
+    size_t* agg_iterations = calloc(num_intervals, sizeof(size_t));
 
-    if (!agg_alloc || !agg_freed) {
+    if (!agg_rss_alloc || !agg_rss_freed || !agg_vss_alloc ||
+        !agg_vss_freed || !agg_iterations) {
         fprintf(stderr, "OOM in generate_final_report\n");
-        free(agg_alloc); free(agg_freed);
+        free(agg_rss_alloc); free(agg_rss_freed);
+        free(agg_vss_alloc); free(agg_vss_freed);
+        free(agg_iterations);
         return;
     }
 
     /* Aggregate per-interval alloc/free across all threads */
+    size_t total_iterations = 0;
     ThreadData* curr_thread = global_stats_head;
     while (curr_thread) {
+        total_iterations += curr_thread->iterations;
         StatSnapshot* curr_snp = curr_thread->snapshots_head;
         while (curr_snp) {
             if (curr_snp->interval_index < num_intervals) {
-                agg_alloc[curr_snp->interval_index] += curr_snp->allocated;
-                agg_freed[curr_snp->interval_index] += curr_snp->freed;
+                agg_rss_alloc [curr_snp->interval_index] += curr_snp->rss_allocated;
+                agg_rss_freed [curr_snp->interval_index] += curr_snp->rss_freed;
+                agg_vss_alloc [curr_snp->interval_index] += curr_snp->vss_allocated;
+                agg_vss_freed [curr_snp->interval_index] += curr_snp->vss_freed;
+                agg_iterations[curr_snp->interval_index] += curr_snp->iterations;
             }
             curr_snp = curr_snp->next;
         }
         curr_thread = curr_thread->next;
     }
 
-    printf("\n=== AGGREGATED BENCHMARK REPORT ===\n");
-    printf("%-8s %-14s %-12s %-12s %-14s %-10s\n",
-           "Time(s)", "Expected(MiB)", "Rate(MiB/s)", "RSS(MiB)",
-           "Bloat(MiB)", "Frag %");
+    if (g_workload == WORKLOAD_FRAG) {
+        /*
+         * In the frag workload every small object is retained and every large
+         * object is freed immediately.  Each allocation's memcpy of
+         * FRAG_TOUCH_SIZE bytes faults exactly one physical page.  The large
+         * objects contribute zero net pages (allocated then freed).  The
+         * theoretical minimum RSS is therefore one page per small allocation,
+         * i.e. one page per iteration.
+         */
+        double theo_mb = ((double)total_iterations * (double)FRAG_TOUCH_SIZE) / (1024.0 * 1024.0);
+        printf("\nTheoretical minimum RSS (frag): iterations=%zu, page_size=%zu B/iter => %.2f MiB\n",
+               total_iterations, g_page_size, theo_mb);
+    }
 
-    size_t prev_alloc = 0;
+    printf("\n=== AGGREGATED BENCHMARK REPORT ===\n");
+    printf("%-8s %-16s %-16s %-16s %-16s %-14s %-12s %-14s %-14s %-10s %-12s\n",
+           "Time(s)", "VSS Alloc(MiB)", "VSS Freed(MiB)",
+           "RSS Alloc(MiB)", "RSS Freed(MiB)",
+           "RSS Expected", "Rate(MiB/s)", "RSS Actual",
+           "RSS Bloat(MiB)", "Frag %", "Iterations");
+
+    size_t prev_rss_alloc = 0;
     for (int i = 0; i < num_intervals; i++) {
         /*
-         * expected_rss = cumulative touch-bytes still live
-         *                (touch-bytes allocated − touch-bytes freed)
+         * rss_expected = (pages allocated − pages freed) * g_page_size
          *
-         * This is a lower bound on RSS: every byte we memcpy'd must have
-         * faulted at least one page into physical memory, so actual RSS
-         * must be >= expected RSS.  If it is not, the environment is
-         * inconsistent (e.g. swap activity or a bug in accounting) and
-         * we abort immediately.
+         * Each memcpy of FRAG_TOUCH_SIZE bytes into a freshly malloc'd object
+         * causes the OS to fault in exactly one physical page, so we count
+         * g_page_size bytes per allocation rather than the raw touch-byte count.
+         * The same unit is subtracted when the corresponding object is freed.
          *
-         * rss_bloat = actual_rss - expected_rss  (allocator overhead / fragmentation)
-         * frag_pct  = rss_bloat / actual_rss * 100
+         * This is a lower bound on RSS: every faulted page must be resident
+         * (assuming no swap), so actual RSS must be >= expected RSS.
+         * A negative bloat indicates swap activity or a bug — we abort.
+         *
+         * rss_bloat = rss_actual - rss_expected  (allocator overhead / fragmentation)
+         * frag_pct  = rss_bloat / rss_actual * 100
+         *
+         * vss_allocated = cumulative bytes requested via malloc() across all threads
+         * vss_freed     = cumulative bytes freed (original malloc sizes)
+         * rss_alloc_mb  = cumulative touch-bytes charged at malloc time (RSS proxy)
+         * rss_freed_mb  = cumulative touch-bytes credited at free time (RSS proxy)
          */
-        double expected_mb = (double)(agg_alloc[i] - agg_freed[i]) / (1024.0 * 1024.0);
-        double rate        = (double)(agg_alloc[i] - prev_alloc)   / (1024.0 * 1024.0) / g_interval;
-        double actual_rss  = history[i].actual_rss_mb;
-        double bloat_mb    = actual_rss - expected_mb;
-        double frag_pct    = (actual_rss > 0.0) ? (bloat_mb / actual_rss) * 100.0 : 0.0;
+        double vss_alloc_mb  = (double)agg_vss_alloc[i]  / (1024.0 * 1024.0);
+        double vss_freed_mb  = (double)agg_vss_freed[i]  / (1024.0 * 1024.0);
+        double rss_alloc_mb  = (double)agg_rss_alloc[i]  / (1024.0 * 1024.0);
+        double rss_freed_mb  = (double)agg_rss_freed[i]  / (1024.0 * 1024.0);
+        double rss_expected  = (rss_alloc_mb - rss_freed_mb);
+        double rate          = (double)(agg_rss_alloc[i] - prev_rss_alloc)   / (1024.0 * 1024.0) / g_interval;
+        double rss_actual    = history[i].actual_rss_mb;
+        double rss_bloat     = rss_actual - rss_expected;
+        double frag_pct      = (rss_actual > 0.0) ? (rss_bloat / rss_actual) * 100.0 : 0.0;
+        size_t iters         = agg_iterations[i];
 
-        printf("%-8d %-14.2f %-12.2f %-12.2f %-14.2f %.2f%%\n",
+        printf("%-8d %-16.2f %-16.2f %-16.2f %-16.2f %-14.2f %-12.2f %-14.2f %-14.2f %.2f%% %-12zu\n",
                (i + 1) * g_interval,
-               expected_mb, rate, actual_rss, bloat_mb, frag_pct);
+               vss_alloc_mb, vss_freed_mb,
+               rss_alloc_mb, rss_freed_mb,
+               rss_expected, rate, rss_actual, rss_bloat, frag_pct, iters);
 
         /* Sanity check: actual RSS must never be less than expected RSS.
          * Pages that were written via memcpy must be resident (no swap assumed).
          * A negative bloat indicates either a bug in touch-byte accounting or
          * that the system is swapping — both are invalid benchmark conditions. */
-        if (bloat_mb < 0.0) {
+        if (rss_bloat < 0.0) {
             fprintf(stderr,
-                    "\n[FATAL] Interval %d: actual RSS (%.2f MiB) < expected RSS (%.2f MiB).\n"
-                    "        Bloat = %.2f MiB — pages we wrote are not resident.\n"
+                    "\n[FATAL] Interval %d: RSS actual (%.2f MiB) < RSS expected (%.2f MiB).\n"
+                    "        RSS Bloat = %.2f MiB — pages we wrote are not resident.\n"
                     "        This indicates swap activity or a bug in touch-byte accounting.\n"
                     "        Aborting benchmark.\n",
-                    (i + 1) * g_interval, actual_rss, expected_mb, bloat_mb);
-            free(agg_alloc);
-            free(agg_freed);
+                    (i + 1) * g_interval, rss_actual, rss_expected, rss_bloat);
+            free(agg_rss_alloc); free(agg_rss_freed);
+            free(agg_vss_alloc); free(agg_vss_freed);
+            free(agg_iterations);
             exit(1);
         }
 
-        prev_alloc = agg_alloc[i];
+        prev_rss_alloc = agg_rss_alloc[i];
     }
 
-    free(agg_alloc);
-    free(agg_freed);
+    free(agg_rss_alloc); free(agg_rss_freed);
+    free(agg_vss_alloc); free(agg_vss_freed);
+    free(agg_iterations);
 }
 
 /* ================================================================
@@ -546,6 +574,10 @@ static void parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     parse_args(argc, argv);
 
+    /* Query the OS page size once; used as the RSS unit per allocation/free */
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps > 0) g_page_size = (size_t)ps;
+
     int            num_intervals = g_duration / g_interval;
     GlobalMonitor* history       = malloc(sizeof(GlobalMonitor) * num_intervals);
     if (!history) { fprintf(stderr, "OOM allocating history\n"); return 1; }
@@ -562,6 +594,7 @@ int main(int argc, char** argv) {
                g_obj_size_min, g_obj_size_max, g_obj_retention);
     }
     printf("----------------------------------------------------------------------\n");
+
 
     pthread_t* threads = malloc(sizeof(pthread_t) * (size_t)g_num_threads);
     if (!threads) { fprintf(stderr, "OOM allocating thread handles\n"); return 1; }
@@ -594,3 +627,4 @@ int main(int argc, char** argv) {
     free(threads);
     return 0;
 }
+
