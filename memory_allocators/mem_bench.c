@@ -66,6 +66,7 @@
  *
  *  -t, --threads  <n>     number of worker threads         (default 1)
  *  --duration   <s>       total run time in seconds        (default 60)
+ *  --max_rss_target <MiB> stop once RSS reaches this limit (default 40% of system memory)
  *  --interval   <s>       reporting interval in seconds    (default 5)
  *  --workload   frag|mixed workload to run                 (default frag)
  *  --obj_size_min <bytes> minimum object size (mixed only) (default 64)
@@ -82,6 +83,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <errno.h>
 
 /* ---- Fragmentation workload constants ---- */
 #define FRAG_SMALL_SIZE   256
@@ -138,6 +140,7 @@ static WorkloadType g_workload       = WORKLOAD_FRAG;
 static size_t       g_obj_size_min   = 64;
 static size_t       g_obj_size_max   = 65536;
 static int          g_obj_retention  = 50;   /* 0-100 % */
+static double       g_max_rss_target_mb = 0.0;
 
 /*
  * System page size, queried once at program start via sysconf(_SC_PAGESIZE).
@@ -147,6 +150,14 @@ static int          g_obj_retention  = 50;   /* 0-100 % */
  * contribution per allocation, and as the estimated RSS freed per free() call.
  */
 static size_t g_page_size = 4096;   /* overwritten in main() */
+
+static double detect_default_max_rss_target_mb(void) {
+    long phys_pages = sysconf(_SC_PHYS_PAGES);
+
+    if (phys_pages <= 0 || g_page_size == 0) return 0.0;
+
+    return ((double)phys_pages * (double)g_page_size * 0.40) / (1024.0 * 1024.0);
+}
 
 /* ---- Global state ---- */
 static atomic_bool      keep_allocating   = true;
@@ -384,8 +395,13 @@ static void* worker_mixed(void* arg) {
  * Reporting
  * ================================================================ */
 
-static void generate_final_report(GlobalMonitor* history) {
-    int     num_intervals  = g_duration / g_interval;
+static void generate_final_report(GlobalMonitor* history, int num_intervals) {
+    if (num_intervals <= 0) {
+        printf("\n=== AGGREGATED BENCHMARK REPORT ===\n");
+        printf("No reporting intervals were captured.\n");
+        return;
+    }
+
     size_t* agg_rss_alloc  = calloc(num_intervals, sizeof(size_t));
     size_t* agg_rss_freed  = calloc(num_intervals, sizeof(size_t));
     size_t* agg_vss_alloc  = calloc(num_intervals, sizeof(size_t));
@@ -514,6 +530,8 @@ static void print_usage(const char* prog) {
     printf("Options:\n");
     printf("  -t, --threads <n>        number of worker threads         (default %d)\n", g_num_threads);
     printf("  --duration    <s>        total run time in seconds        (default %d)\n", g_duration);
+    printf("  --max_rss_target <MiB>   stop once RSS reaches this limit (default %.2f MiB; 40%% system memory)\n",
+           g_max_rss_target_mb);
     printf("  --interval    <s>        reporting interval in seconds    (default %d)\n", g_interval);
     printf("  --workload    frag|mixed workload type                    (default frag)\n");
     printf("  --obj_size_min <bytes>   min object size (mixed only)     (default %zu)\n", g_obj_size_min);
@@ -530,6 +548,15 @@ static void parse_args(int argc, char** argv) {
             g_num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
             g_duration = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "--max_rss_target") == 0 || strcmp(argv[i], "--maxRSSTarget") == 0) && i + 1 < argc) {
+            char* end = NULL;
+
+            errno = 0;
+            g_max_rss_target_mb = strtod(argv[++i], &end);
+            if (errno != 0 || end == argv[i] || *end != '\0') {
+                fprintf(stderr, "--max_rss_target must be a positive number of MiB\n");
+                exit(1);
+            }
         } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
             g_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--workload") == 0 && i + 1 < argc) {
@@ -558,6 +585,10 @@ static void parse_args(int argc, char** argv) {
     /* Validate */
     if (g_num_threads < 1) { fprintf(stderr, "--threads must be >= 1\n");  exit(1); }
     if (g_duration <= 0)   { fprintf(stderr, "--duration must be > 0\n");  exit(1); }
+    if (g_max_rss_target_mb <= 0.0) {
+        fprintf(stderr, "--max_rss_target must be > 0 MiB\n");
+        exit(1);
+    }
     if (g_interval <= 0)   { fprintf(stderr, "--interval must be > 0\n");  exit(1); }
     if (g_obj_size_min < 1) {
         fprintf(stderr, "--obj_size_min must be >= 1\n"); exit(1);
@@ -572,11 +603,13 @@ static void parse_args(int argc, char** argv) {
  * ================================================================ */
 
 int main(int argc, char** argv) {
-    parse_args(argc, argv);
-
     /* Query the OS page size once; used as the RSS unit per allocation/free */
     long ps = sysconf(_SC_PAGESIZE);
     if (ps > 0) g_page_size = (size_t)ps;
+
+    g_max_rss_target_mb = detect_default_max_rss_target_mb();
+
+    parse_args(argc, argv);
 
     int            num_intervals = g_duration / g_interval;
     GlobalMonitor* history       = malloc(sizeof(GlobalMonitor) * num_intervals);
@@ -587,8 +620,8 @@ int main(int argc, char** argv) {
 
     printf("Starting MemBench CLI\n");
     check_thp();
-    printf("Config: Threads=%d, Duration=%ds, Interval=%ds, Workload=%s\n",
-           g_num_threads, g_duration, g_interval, workload_name);
+    printf("Config: Threads=%d, Duration=%ds, Interval=%ds, Workload=%s, maxRSSTarget=%.2f MiB\n",
+           g_num_threads, g_duration, g_interval, workload_name, g_max_rss_target_mb);
     if (g_workload == WORKLOAD_MIXED) {
         printf("  Object size: [%zu, %zu] bytes | Retention: %d%%\n",
                g_obj_size_min, g_obj_size_max, g_obj_retention);
@@ -609,22 +642,37 @@ int main(int argc, char** argv) {
         pthread_create(&threads[i], NULL, worker_fn, id);
     }
 
-    /* Main monitor loop: sleep per interval, sample RSS */
+    /* Main monitor loop: sleep per interval, sample RSS, stop early on RSS limit */
+    int intervals_captured = 0;
+    bool stopped_by_rss_target = false;
     for (int i = 0; i < num_intervals; i++) {
         sleep((unsigned int)g_interval);
         double current_rss = (double)get_rss_kb() / 1024.0;
-        history[i].actual_rss_mb = current_rss;
+        history[intervals_captured].actual_rss_mb = current_rss;
+        intervals_captured++;
         printf("[Live] Interval %d/%d | RSS: %.2f MiB\n",
                i + 1, num_intervals, current_rss);
+
+        if (current_rss >= g_max_rss_target_mb) {
+            printf("[Live] maxRSSTarget reached (%.2f MiB >= %.2f MiB) | requesting workers to stop\n",
+                   current_rss, g_max_rss_target_mb);
+            atomic_store(&keep_allocating, false);
+            stopped_by_rss_target = true;
+            break;
+        }
     }
 
-    atomic_store(&keep_allocating, false);
+    if (!stopped_by_rss_target) atomic_store(&keep_allocating, false);
     for (int i = 0; i < g_num_threads; i++) pthread_join(threads[i], NULL);
 
-    generate_final_report(history);
+    if (stopped_by_rss_target) {
+        printf("Benchmark stopped early after %d interval(s) because maxRSSTarget was reached.\n",
+               intervals_captured);
+    }
+
+    generate_final_report(history, intervals_captured);
 
     free(history);
     free(threads);
     return 0;
 }
-

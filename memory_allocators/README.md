@@ -72,6 +72,7 @@ between runs.
 |---|---|---|
 | Benchmark duration | 60 s | First CLI argument: `./membench <seconds>` |
 | Thread count | 1 | Environment variable: `NUM_THREADS=<n>` |
+| Max RSS target | 40% of system memory | `--max_rss_target <MiB>` |
 | Reporting interval | 5 s | Hardcoded |
 
 ### Per-thread loop
@@ -97,7 +98,7 @@ across all threads:
 | `Bloat(MiB)` | `RSS − Used` | Memory the OS holds beyond the live set |
 | `Frag %` | `Bloat / RSS × 100` | Fragmentation proxy — lower is better |
 
-`run.sh` reads the **final-interval row** of each run to produce the summary table.
+`run.sh` ignores the first 3 report rows from each run, then uses the median of the remaining `Rate(MiB/s)` and `Frag %` values to produce allocator comparisons.
 
 ---
 

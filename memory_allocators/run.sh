@@ -21,6 +21,7 @@
 #
 #   -t, --threads      <n>        number of worker threads          (default 4)
 #   --duration         <s>        total run time per benchmark (s)  (default 30)
+#   --max_rss_target   <MiB>      stop once RSS reaches this limit   (default 40% of system memory)
 #   --workload         frag|mixed workload to pass to membench       (default frag)
 #   --obj_size_min     <bytes>    min object size; mixed only        (default 64)
 #   --obj_size_max     <bytes>    max object size; mixed only        (default 65536)
@@ -214,6 +215,7 @@ WORKLOAD="frag"
 OBJ_SIZE_MIN=""
 OBJ_SIZE_MAX=""
 OBJ_RETENTION=""
+MAX_RSS_TARGET=""
 
 # Each entry is  "display_name:/path/to/lib.so"
 # Leave the path component empty for the system default (ptmalloc2).
@@ -234,6 +236,7 @@ Usage: $(basename "$0") [options]
 Options:
   -t, --threads     <n>        number of worker threads          (default ${THREADS})
   --duration        <s>        total run time per benchmark (s)  (default ${DURATION})
+  --max_rss_target  <MiB>      stop once RSS reaches this limit   (default auto: 40% of system memory)
   --workload        frag|mixed workload to pass to membench       (default ${WORKLOAD})
   --obj_size_min    <bytes>    min object size; mixed only        (default 64)
   --obj_size_max    <bytes>    max object size; mixed only        (default 65536)
@@ -248,6 +251,8 @@ while [[ $# -gt 0 ]]; do
             THREADS="$2"; shift 2 ;;
         --duration)
             DURATION="$2"; shift 2 ;;
+        --max_rss_target|--maxRSSTarget)
+            MAX_RSS_TARGET="$2"; shift 2 ;;
         --workload)
             WORKLOAD="$2"; shift 2 ;;
         --obj_size_min)
@@ -272,15 +277,66 @@ fi
 if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [[ "$DURATION" -lt 1 ]]; then
     echo "[ERROR] --duration must be a positive integer." >&2; exit 1
 fi
+if [[ -n "$MAX_RSS_TARGET" ]] && { ! [[ "$MAX_RSS_TARGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v v="$MAX_RSS_TARGET" 'BEGIN { exit !(v > 0) }'; }; then
+    echo "[ERROR] --max_rss_target must be a positive number of MiB." >&2; exit 1
+fi
 if [[ "$WORKLOAD" != "frag" && "$WORKLOAD" != "mixed" ]]; then
     echo "[ERROR] --workload must be 'frag' or 'mixed'." >&2; exit 1
 fi
 
 # Build the membench flags that will be forwarded on every invocation
 BENCH_FLAGS=("--duration" "$DURATION" "--workload" "$WORKLOAD" "-t" "$THREADS")
+[[ -n "$MAX_RSS_TARGET" ]] && BENCH_FLAGS=("--duration" "$DURATION" "--max_rss_target" "$MAX_RSS_TARGET" "--workload" "$WORKLOAD" "-t" "$THREADS")
 [[ -n "$OBJ_SIZE_MIN"  ]] && BENCH_FLAGS+=("--obj_size_min"  "$OBJ_SIZE_MIN")
 [[ -n "$OBJ_SIZE_MAX"  ]] && BENCH_FLAGS+=("--obj_size_max"  "$OBJ_SIZE_MAX")
 [[ -n "$OBJ_RETENTION" ]] && BENCH_FLAGS+=("--obj_retention" "$OBJ_RETENTION")
+
+extract_run_medians() {
+    local raw_out="$1"
+
+    awk '
+    function sort_numeric(arr, n,    i, j, tmp) {
+        for (i = 1; i <= n; i++) {
+            for (j = i + 1; j <= n; j++) {
+                if (arr[i] > arr[j]) {
+                    tmp = arr[i]
+                    arr[i] = arr[j]
+                    arr[j] = tmp
+                }
+            }
+        }
+    }
+
+    function median(arr, n,    mid) {
+        sort_numeric(arr, n)
+        if (n % 2 == 1) return sprintf("%.2f", arr[(n + 1) / 2])
+        mid = n / 2
+        return sprintf("%.2f", (arr[mid] + arr[mid + 1]) / 2.0)
+    }
+
+    /^[0-9]/ {
+        row_count++
+        rate_all[row_count] = $7 + 0
+        frag = $10
+        gsub(/%/, "", frag)
+        frag_all[row_count] = frag + 0
+    }
+
+    END {
+        start = 4
+        kept = 0
+
+        for (i = start; i <= row_count; i++) {
+            kept++
+            rates[kept] = rate_all[i]
+            frags[kept] = frag_all[i]
+        }
+
+        if (kept == 0) exit 1
+
+        printf "%s %s\n", median(rates, kept), median(frags, kept)
+    }' "$raw_out"
+}
 
 # ---------------------------------------------------------------------------
 # 3. Output directories (relative to the caller's working directory)
@@ -379,6 +435,7 @@ echo ""
 echo "[$(date '+%H:%M:%S')] === Benchmark Configuration ==="
 echo "  Binary        : ${BINARY}"
 echo "  Duration      : ${DURATION}s per run"
+echo "  maxRSSTarget  : ${MAX_RSS_TARGET:-auto (40% of system memory, resolved by membench)}"
 echo "  Threads       : ${THREADS}"
 echo "  Workload      : ${WORKLOAD}"
 if [[ "$WORKLOAD" == "mixed" ]]; then
@@ -390,6 +447,7 @@ echo "  Output dir    : ${OUT_DIR}"
 echo "  Perf dir      : ${PERF_DIR}"
 echo "  Log file      : ${LOG_FILE}"
 echo "  membench flags: ${BENCH_FLAGS[*]}"
+echo "  Summary stats : median of report rows after skipping first 3 iterations"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -458,8 +516,8 @@ for alloc_entry in "${ALLOCATORS[@]}"; do
     chmod 755 "${PERF_SCRIPT_OUT}"
     echo "  [$(date '+%H:%M:%S')] perf script saved → ${PERF_SCRIPT_OUT}"
 
-    # Parse summary line from membench output.
-    # The AGGREGATED BENCHMARK REPORT columns (11 total):
+    # Parse summary metrics from the AGGREGATED BENCHMARK REPORT.
+    # The report columns (11 total):
     #   $1  Time(s)
     #   $2  VSS Alloc(MiB)
     #   $3  VSS Freed(MiB)
@@ -471,10 +529,13 @@ for alloc_entry in "${ALLOCATORS[@]}"; do
     #   $9  RSS Bloat(MiB)
     #   $10 Frag %             ← printed as "N.NN%" (no space before %)
     #   $11 Iterations
-    LAST_LINE=$(grep -E '^[0-9]' "$RAW_OUT" | tail -n 1)
-    RATE=$(awk '{print $7}' <<< "$LAST_LINE")
-    # Strip a trailing '%' if present (e.g. "8.18%" → "8.18")
-    FRAG=$(awk '{gsub(/%/,""); print $10}' <<< "$LAST_LINE")
+    if MEDIAN_METRICS="$(extract_run_medians "$RAW_OUT")"; then
+        read -r RATE FRAG <<< "$MEDIAN_METRICS"
+    else
+        echo "  [WARNING] Could not extract median summary metrics for ${name}/${THREADS}t."
+        RATE="NA"
+        FRAG="NA"
+    fi
 
     printf "%-14s %-12s %-16s %-10s\n" "$name" "$THREADS" "$RATE" "$FRAG"
 
@@ -503,7 +564,7 @@ if [[ ${#RESULT_NAMES[@]} -eq 0 ]]; then
 else
     echo ""
     echo "================================================================================"
-    echo "[$(date '+%H:%M:%S')] === Allocator Comparison Summary ==="
+    echo "[$(date '+%H:%M:%S')] === Allocator Comparison Summary (median after warm-up) ==="
     echo "================================================================================"
     printf "%-14s %-20s %-14s\n" "Allocator" "Alloc Rate (MiB/s)" "Frag %"
     echo "--------------------------------------------------------------------------------"
