@@ -32,6 +32,108 @@
 set -euo pipefail
 
 NUM_VCORES=$(nproc)
+
+# ---------------------------------------------------------------------------
+# Transparent Huge Page (THP) helpers – tcmalloc only
+#
+# thp_set   – saves current kernel THP settings and applies the values that
+#             are optimal for tcmalloc's large-span allocations:
+#               enabled       → always          (use THPs system-wide)
+#               defrag        → defer+madvise   (promote on madvise; defer
+#                                                background compaction)
+#               max_ptes_none → 0               (khugepaged never fills a
+#                                                region unless all pages are
+#                                                already huge; "none" in the
+#                                                sense that no non-huge PTEs
+#                                                are tolerated)
+#
+# thp_restore – writes the values that were saved by thp_set back to the
+#               kernel knobs.  Safe to call even if thp_set never ran (the
+#               saved variables will be empty and the writes are skipped).
+#
+# An EXIT trap calls thp_restore so the originals are always reinstated,
+# even when the script exits early with a non-zero status.
+# ---------------------------------------------------------------------------
+
+THP_ENABLED_PATH="/sys/kernel/mm/transparent_hugepage/enabled"
+THP_DEFRAG_PATH="/sys/kernel/mm/transparent_hugepage/defrag"
+THP_MAX_PTES_NONE_PATH="/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none"
+
+_SAVED_THP_ENABLED=""
+_SAVED_THP_DEFRAG=""
+_SAVED_THP_MAX_PTES_NONE=""
+
+thp_set() {
+    # Require root – writing to /sys requires elevated privileges.
+    if [[ $EUID -ne 0 ]]; then
+        echo "[WARNING] THP tuning requires root privileges (current EUID=${EUID}). Skipping THP configuration."
+        return 0
+    fi
+
+    # Check that all three sysfs knobs exist before touching any of them.
+    local missing=0
+    for p in "$THP_ENABLED_PATH" "$THP_DEFRAG_PATH" "$THP_MAX_PTES_NONE_PATH"; do
+        if [[ ! -f "$p" ]]; then
+            echo "[WARNING] THP knob not found: ${p}. Skipping THP configuration."
+            missing=1
+        fi
+    done
+    [[ $missing -ne 0 ]] && return 0
+
+    # Capture current values before making any changes.
+    # The 'enabled' and 'defrag' files show the active token surrounded by
+    # brackets, e.g. "[madvise] always never".  Extract only the bracketed word.
+    _SAVED_THP_ENABLED="$(awk 'match($0, /\[([^\]]+)\]/, a) { print a[1] }' "$THP_ENABLED_PATH")"
+    _SAVED_THP_DEFRAG="$(awk 'match($0, /\[([^\]]+)\]/, a) { print a[1] }' "$THP_DEFRAG_PATH")"
+    _SAVED_THP_MAX_PTES_NONE="$(cat "$THP_MAX_PTES_NONE_PATH")"
+
+    echo "[$(date '+%H:%M:%S')] THP: saving current values:"
+    echo "  ${THP_ENABLED_PATH}       = ${_SAVED_THP_ENABLED}"
+    echo "  ${THP_DEFRAG_PATH}        = ${_SAVED_THP_DEFRAG}"
+    echo "  ${THP_MAX_PTES_NONE_PATH} = ${_SAVED_THP_MAX_PTES_NONE}"
+
+    # Apply tcmalloc-optimal settings.
+    echo "always"        > "$THP_ENABLED_PATH"
+    echo "defer+madvise" > "$THP_DEFRAG_PATH"
+    echo "0"             > "$THP_MAX_PTES_NONE_PATH"
+
+    echo "[$(date '+%H:%M:%S')] THP: applied settings:"
+    echo "  enabled       → always"
+    echo "  defrag        → defer+madvise"
+    echo "  max_ptes_none → 0 (no non-huge PTEs tolerated)"
+}
+
+thp_restore() {
+    # Nothing to restore if thp_set was never called or was skipped.
+    if [[ -z "$_SAVED_THP_ENABLED" && -z "$_SAVED_THP_DEFRAG" && -z "$_SAVED_THP_MAX_PTES_NONE" ]]; then
+        return 0
+    fi
+
+    if [[ $EUID -ne 0 ]]; then
+        echo "[WARNING] THP restore requires root privileges (current EUID=${EUID}). Cannot restore THP settings."
+        return 0
+    fi
+
+    echo "[$(date '+%H:%M:%S')] THP: restoring original values:"
+    echo "  enabled       → ${_SAVED_THP_ENABLED}"
+    echo "  defrag        → ${_SAVED_THP_DEFRAG}"
+    echo "  max_ptes_none → ${_SAVED_THP_MAX_PTES_NONE}"
+
+    [[ -f "$THP_ENABLED_PATH"       ]] && echo "$_SAVED_THP_ENABLED"       > "$THP_ENABLED_PATH"
+    [[ -f "$THP_DEFRAG_PATH"        ]] && echo "$_SAVED_THP_DEFRAG"        > "$THP_DEFRAG_PATH"
+    [[ -f "$THP_MAX_PTES_NONE_PATH" ]] && echo "$_SAVED_THP_MAX_PTES_NONE" > "$THP_MAX_PTES_NONE_PATH"
+
+    # Clear saved state so a second call is a no-op.
+    _SAVED_THP_ENABLED=""
+    _SAVED_THP_DEFRAG=""
+    _SAVED_THP_MAX_PTES_NONE=""
+
+    echo "[$(date '+%H:%M:%S')] THP: original values restored."
+}
+
+# Ensure THP settings are always reinstated on any exit (normal or error).
+trap thp_restore EXIT
+
 # ===========================================================================
 # Allocator tunables
 #
@@ -485,6 +587,13 @@ for alloc_entry in "${ALLOCATORS[@]}"; do
     echo "  Duration     : ${DURATION}s"
     echo "  Binary       : ${BINARY}"
 
+    # Apply THP settings optimised for tcmalloc before this run begins.
+    # thp_restore is called after the run (and also on any early exit via the
+    # EXIT trap registered at the top of the script).
+    if [[ "$name" == "tcmalloc" ]]; then
+        thp_set
+    fi
+
     # Paths for this run
     RAW_OUT="${OUT_DIR}/${name}_${THREADS}t_${TIMESTAMP}.txt"
     RUN_PERF_DIR="${PERF_DIR}/${name}_${THREADS}t"
@@ -515,6 +624,12 @@ for alloc_entry in "${ALLOCATORS[@]}"; do
     }
     chmod 755 "${PERF_SCRIPT_OUT}"
     echo "  [$(date '+%H:%M:%S')] perf script saved → ${PERF_SCRIPT_OUT}"
+
+    # Restore THP settings to their original values now that the tcmalloc run
+    # is finished.  For all other allocators this is a no-op.
+    if [[ "$name" == "tcmalloc" ]]; then
+        thp_restore
+    fi
 
     # Parse summary metrics from the AGGREGATED BENCHMARK REPORT.
     # The report columns (11 total):
