@@ -30,13 +30,170 @@
 
 set -euo pipefail
 
-# Setting top chunk padding for ptmalloc2 to reduce number of sbrk calls.
-# Set it to 512m.
-# This increases memory wastage but improves the performance of ptmalloc2 by atleast 30%-40%
-export MALLOC_TOP_PAD_=536870912
+NUM_VCORES=$(nproc)
+# ===========================================================================
+# Allocator tunables
+#
+# Uncomment and adjust any variable below to override the allocator default.
+# All variables are exported so they are visible to child processes (membench
+# and any LD_PRELOAD'd allocator library).
+# ===========================================================================
 
-# Set TCMALLOC_SKIP_SBRK to 1 to force tcmalloc to only use mmap
+# ---------------------------------------------------------------------------
+# ptmalloc2 (glibc) tunables
+# ---------------------------------------------------------------------------
+
+# MALLOC_TOP_PAD_  (default: 131072 = 128 KiB)
+#   Extra bytes added to each sbrk(2) call when growing the heap, and the
+#   amount of free space preserved at the top after trimming.  Raising this
+#   reduces sbrk call frequency at the cost of more resident virtual memory.
+#   NOTE: setting this variable disables glibc's dynamic mmap-threshold
+#   adjustment.  The value used (10 MiB) improves ptmalloc2 throughput by
+#   ~30-40% in allocation-heavy benchmarks.
+export MALLOC_TOP_PAD_=10485760
+
+# MALLOC_TRIM_THRESHOLD_  (default: 131072 = 128 KiB)
+#   Minimum amount of free memory at the top of the heap before free(3) calls
+#   sbrk(2) to release it back to the OS.  Raise to reduce trim syscalls;
+#   set to -1 to disable trimming entirely.
+# Setting MALLOC_TRIM_THRESHOLD to the same value as MALLOC_TOP_PAD_
+export MALLOC_TRIM_THRESHOLD_=10485760
+
+# MALLOC_MMAP_THRESHOLD_  (default: 131072 = 128 KiB, auto-grows up to ~32 MiB)
+#   Allocations >= this size use mmap(2) instead of the brk heap.  mmap'd
+#   blocks are returned to the OS immediately on free but cannot be reused
+#   from the free list.  Raise to keep more allocations on the heap (better
+#   reuse, lower RSS churn); lower to release large blocks immediately.
+#   NOTE: setting this variable disables dynamic threshold adjustment.
+# export MALLOC_MMAP_THRESHOLD_=1048576     # 1 MiB
+
+# MALLOC_MMAP_MAX_  (default: 65536)
+#   Maximum number of simultaneous mmap(2) allocations.  Set to 0 to disable
+#   mmap entirely and use brk only.
+# export MALLOC_MMAP_MAX_=65536
+
+# MALLOC_ARENA_MAX  (default: 0 = auto, derived from MALLOC_ARENA_TEST x CPUs)
+#   Hard cap on the number of malloc arenas.  More arenas reduce lock
+#   contention across threads but increase per-arena memory overhead and
+#   fragmentation.  Set equal to thread count for maximum parallel throughput.
+export MALLOC_ARENA_MAX=${NUM_VCORES}
+
+# MALLOC_ARENA_TEST  (default: 2 on 32-bit, 8 on 64-bit)
+#   Number of arenas to create before the arena cap is computed (typically
+#   2-8x CPU count).  Only consulted when MALLOC_ARENA_MAX=0.
+# export MALLOC_ARENA_TEST=8
+
+# MALLOC_PERTURB_  (default: 0 = disabled)
+#   When nonzero, fills allocated bytes with ~(value & 0xff) and freed bytes
+#   with (value & 0xff) to catch use-after-free / uninitialised-read bugs.
+#   Always keep at 0 in performance benchmarks.
+# export MALLOC_PERTURB_=0
+
+# ---------------------------------------------------------------------------
+# tcmalloc (gperftools) tunables
+# ---------------------------------------------------------------------------
+
+# TCMALLOC_SKIP_SBRK  (default: false)
+#   When 1, tcmalloc never calls sbrk(2) and obtains all memory via mmap(2).
+#   Useful to isolate mmap-only behaviour or in environments where sbrk is
+#   undesirable.
 # export TCMALLOC_SKIP_SBRK=1
+
+# TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES  (default: 33554432 = 32 MiB)
+#   Upper bound on the combined size of all per-thread caches.  Larger values
+#   reduce trips to the central free list and lower lock contention, at the
+#   cost of higher RSS.  Typical tuning range: 64 MiB - 512 MiB for highly
+#   parallel benchmarks.
+# export TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=33554432
+
+# TCMALLOC_RELEASE_RATE  (default: 1.0, range: 0-10)
+#   Rate at which free spans are returned to the kernel via madvise.  0 =
+#   never release (maximises throughput); 10 = release aggressively (minimises
+#   RSS).
+# export TCMALLOC_RELEASE_RATE=1.0
+
+# TCMALLOC_AGGRESSIVE_DECOMMIT  (default: false)
+#   When 1, every freed span is immediately returned to the kernel instead of
+#   being held in the page heap.  Reduces RSS at a ~2% CPU throughput cost.
+# export TCMALLOC_AGGRESSIVE_DECOMMIT=0
+
+# TCMALLOC_HEAP_LIMIT_MB  (default: 0 = no limit)
+#   Hard cap on total page heap size in MiB.  When hit, tcmalloc attempts to
+#   return free spans; if insufficient it OOMs.  Use to simulate memory-
+#   constrained production environments.
+# export TCMALLOC_HEAP_LIMIT_MB=0
+
+# TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD  (default: 1073741824 = 1 GiB)
+#   Allocations larger than this emit a stack trace to stderr.  Leave at the
+#   default for clean benchmark output; lower to diagnose unexpectedly large
+#   allocations.
+# export TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=1073741824
+
+# TCMALLOC_SKIP_MMAP  (default: false)
+#   When 1, tcmalloc never calls mmap(2) and uses sbrk(2) only.
+# export TCMALLOC_SKIP_MMAP=0
+
+# TCMALLOC_SAMPLE_PARAMETER  (default: 0 = sampling disabled)
+#   Average byte interval between heap profile samples.  Leave at 0 in
+#   throughput benchmarks; a value of 524288 (512 KiB) is reasonable for
+#   profiling.
+# export TCMALLOC_SAMPLE_PARAMETER=0
+
+# ---------------------------------------------------------------------------
+# jemalloc tunables  (all set via the MALLOC_CONF environment variable)
+#
+# Format: MALLOC_CONF="key:value,key:value,..."
+# ---------------------------------------------------------------------------
+
+# narenas  (default: 4 x CPU count)
+#   Maximum number of arenas for automatic thread-arena multiplexing.  More
+#   arenas improve multi-thread scalability by reducing lock contention;
+#   fewer arenas reduce per-arena metadata overhead and cross-arena
+#   fragmentation.  Set to thread count for maximum parallel throughput.
+#
+# background_thread  (default: false)
+#   Enables internal background worker threads for asynchronous decay-based
+#   purging.  Offloads purge latency from application threads.
+#
+# dirty_decay_ms  (default: 10000 = 10 s)
+#   Milliseconds before unused dirty pages are purged via madvise.  0 =
+#   purge immediately; -1 = never purge.  Raise or set -1 for maximum
+#   throughput; lower to track RSS more closely.
+#
+# muzzy_decay_ms  (default: 10000 = 10 s)
+#   Milliseconds before muzzy pages (MADV_FREE'd) are forcibly reclaimed via
+#   MADV_DONTNEED.  0 = reclaim immediately; -1 = never reclaim.
+#
+# tcache  (default: true)
+#   Enables per-thread caches for small and medium allocations, avoiding all
+#   synchronisation on the fast path.  Disable only for no-cache baselines.
+#
+# tcache_max  (default: 32768 = 32 KiB)
+#   Maximum size class cached per-thread.  Raise to cache larger objects and
+#   improve throughput for medium allocations; lower to reduce per-thread
+#   memory overhead.
+#
+# lg_extent_max_active_fit  (default: 6 = 64x ratio)
+#   Log2 of the maximum ratio between a reused extent's size and the
+#   requested allocation size.  Lower (e.g. 3-4) to reduce fragmentation.
+#
+# percpu_arena  (default: disabled; options: disabled|percpu|phycpu)
+#   Binds threads to arenas by CPU.  "percpu" (one arena per logical CPU)
+#   often gives the best throughput in NUMA-aware or CPU-pinned workloads.
+#
+# thp  (default: default; options: default|always|never)
+#   Transparent huge page hint for user-facing memory.  "always" improves
+#   TLB efficiency for large working sets at the cost of higher RSS.
+#
+# metadata_thp  (default: disabled; options: disabled|auto|always)
+#   THP hint for jemalloc's own internal metadata.  "auto" enables THP for
+#   metadata once it grows large.
+#
+# retain  (default: true on 64-bit Linux)
+#   When true, jemalloc retains virtual memory for faster future reuse
+#   instead of munmap(2)'ing it.  Set false to measure RSS more accurately.
+#
+export MALLOC_CONF="narenas:${NUM_VCORES},background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000,tcache:true,tcache_max:32768,lg_extent_max_active_fit:6,percpu_arena:percpu,thp:default,metadata_thp:disabled,retain:true"
 
 # ---------------------------------------------------------------------------
 # 0. Resolve repository root and script-relative paths
